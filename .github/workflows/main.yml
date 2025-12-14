@@ -1,113 +1,495 @@
-name: Rdp_Otako1k
+name: Infinite RDP Server
 
 on:
   workflow_dispatch:
+    inputs:
+      idle_timeout:
+        description: 'Auto shutdown after X minutes of inactivity'
+        required: false
+        default: '240'
+        type: number
+      reset_every_hours:
+        description: 'Automatically reset every X hours (0 to disable)'
+        required: false
+        default: '12'
+        type: number
+      install_tools:
+        description: 'Install development tools'
+        required: false
+        default: true
+        type: boolean
+      enable_ssh:
+        description: 'Enable SSH access via Tailscale'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  RDP_USERNAME: "GitHubRDP"
+  SESSION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+  HOSTNAME: "gh-rdp-${{ github.run_id }}-${{ github.run_attempt }}"
 
 jobs:
-  secure-rdp:
+  infinite-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
-
+    
+    # إزالة المهلة الزمنية للعملية لتكون لا نهائية
+    timeout-minutes: 0
+    
     steps:
-      - name: Configure Core RDP Settings
+      - name: Initialize Session
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Write-Host "=== INFINITE RDP SESSION ==="
+          Write-Host "Session ID: $env:SESSION_ID"
+          Write-Host "Hostname: $env:HOSTNAME"
+          Write-Host "Started at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "==========================="
+          
+          # إنشاء مجلد للجلسة
+          New-Item -ItemType Directory -Path "C:\RDP-Session" -Force | Out-Null
+          
+          # تخزين معلومات البدء
+          $sessionInfo = @{
+            StartTime = Get-Date
+            SessionID = $env:SESSION_ID
+            Hostname = $env:HOSTNAME
+            Runner = $env:RUNNER_NAME
+          } | ConvertTo-Json
+          
+          Set-Content -Path "C:\RDP-Session\session-info.json" -Value $sessionInfo
+
+      - name: Configure Windows for RDP
+        run: |
+          # تمكين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # ضبط إعدادات أمان متقدمة
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+                           -Name "SecurityLayer" -Value 2 -Force
+          
+          # زيادة وقت المهلة لتجنب انقطاع الجلسات
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+                           -Name "MaxIdleTime" -Value 86400000  # 24 ساعة
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # تعطيل إعادة التوجيه للطابعة (توفير الموارد)
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
+                           -Name "fDisableCpm" -Value 1 -Force -ErrorAction SilentlyContinue
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: Create Persistent User Account
+        id: create_user
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          # إنشاء كلمة مرور قوية
+          function Generate-Password {
+              param([int]$Length = 20)
+              $charSet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'.ToCharArray()
+              $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+              $bytes = New-Object byte[] $Length
+              $rng.GetBytes($bytes)
+              $password = -join ($bytes | ForEach-Object { $charSet[$_ % $charSet.Length] })
+              $rng.Dispose()
+              return $password
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          $password = Generate-Password -Length 24
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          # إنشاء المستخدم إذا لم يكن موجوداً
+          $userExists = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          
+          if (-not $userExists) {
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -PasswordNeverExpires
+              Write-Host "Created new user: $env:RDP_USERNAME"
+          } else {
+              # إعادة تعيين كلمة المرور للمستخدم الموجود
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass
+              Write-Host "Reset password for existing user: $env:RDP_USERNAME"
           }
+          
+          # إضافة المستخدم إلى المجموعات المطلوبة
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          
+          # تخزين كلمة المرور بشكل آمن
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          echo "::add-mask::$password"
+          
+          # حفظ كلمة المرور في ملف مؤقت (للاسترجاع)
+          $creds = @{
+              Username = $env:RDP_USERNAME
+              Password = $password
+              Generated = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          } | ConvertTo-Json
+          
+          Set-Content -Path "C:\RDP-Session\credentials.json" -Value $creds -Encoding UTF8
 
-      - name: Install Tailscale
+      - name: Configure Firewall Rules
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          # حذف أي قواعد قديمة
+          netsh advfirewall firewall delete rule name="GitHub-RDP-Infinite" 2>$null
+          netsh advfirewall firewall delete rule name="GitHub-SSH-Infinite" 2>$null
+          
+          # السماح بـ RDP عبر Tailscale فقط
+          netsh advfirewall firewall add rule name="GitHub-RDP-Infinite" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            remoteip=100.64.0.0/10  # نطاق Tailscale
+          
+          # السماح بـ SSH إذا كان مفعلاً
+          if ("${{ github.event.inputs.enable_ssh }}" -eq "true") {
+              netsh advfirewall firewall add rule name="GitHub-SSH-Infinite" `
+                dir=in action=allow protocol=TCP localport=22 `
+                remoteip=100.64.0.0/10
+          }
+          
+          # منع الاتصالات العامة على منفذ RDP
+          netsh advfirewall firewall add rule name="Block-Public-RDP" `
+            dir=in action=block protocol=TCP localport=3389 `
+            remoteip=any
+
+      - name: Install and Setup Tailscale
+        run: |
+          # تثبيت Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale-infinite.msi"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          # انتظار تثبيت الخدمة
+          Start-Sleep -Seconds 10
+          
+          # الاتصال بشبكة Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$env:HOSTNAME `
+            --accept-routes `
+            --accept-dns=false `
+            --reset
+          
+          # الحصول على عنوان IP
+          $maxRetries = 10
+          $retryCount = 0
+          $tailscaleIP = $null
+          
+          while ($retryCount -lt $maxRetries -and -not $tailscaleIP) {
               Start-Sleep -Seconds 5
-              $retries++
+              $tailscaleIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              $retryCount++
           }
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          if (-not $tailscaleIP) {
+              Write-Error "Failed to get Tailscale IP after $maxRetries attempts"
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          echo "TAILSCALE_IP=$tailscaleIP" >> $env:GITHUB_ENV
+          
+          # حفظ معلومات الشبكة
+          $networkInfo = @{
+              TailscaleIP = $tailscaleIP
+              TailscaleStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+          } | ConvertTo-Json
+          
+          Set-Content -Path "C:\RDP-Session\network-info.json" -Value $networkInfo
 
-      - name: Maintain Connection
+      - name: Install Development Tools (Optional)
+        if: ${{ github.event.inputs.install_tools }}
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "Installing development tools..."
           
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          # تثبيت Chocolatey إذا لم يكن مثبتاً
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           }
+          
+          # قائمة الأدوات للتثبيت
+          $tools = @(
+              "git",
+              "curl",
+              "wget",
+              "7zip",
+              "vscode",
+              "python",
+              "nodejs-lts",
+              "docker-desktop",
+              "sysinternals",
+              "powershell-core",
+              "googlechrome",
+              "firefox"
+          )
+          
+          foreach ($tool in $tools) {
+              try {
+                  choco install $tool -y --no-progress
+                  Write-Host "✓ Installed: $tool"
+              } catch {
+                  Write-Warning "Failed to install: $tool"
+              }
+          }
+          
+          # إنشاء اختصارات سطح المكتب
+          $desktopPath = [Environment]::GetFolderPath("Desktop")
+          $shortcuts = @(
+              @{Name="Terminal.lnk"; Target="wt.exe"; Arguments=""; Icon="%SystemRoot%\System32\cmd.exe"},
+              @{Name="PowerShell.lnk"; Target="pwsh.exe"; Arguments="-NoExit"; Icon="%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"},
+              @{Name="VS Code.lnk"; Target="code.exe"; Arguments=""; Icon="%ProgramFiles%\Microsoft VS Code\Code.exe"}
+          )
+          
+          foreach ($shortcut in $shortcuts) {
+              $shell = New-Object -ComObject WScript.Shell
+              $link = $shell.CreateShortcut("$desktopPath\$($shortcut.Name)")
+              $link.TargetPath = $shortcut.Target
+              $link.Arguments = $shortcut.Arguments
+              $link.IconLocation = $shortcut.Icon
+              $link.Save()
+          }
+
+      - name: Setup SSH Server (Optional)
+        if: ${{ github.event.inputs.enable_ssh }}
+        run: |
+          Write-Host "Setting up SSH server..."
+          
+          # تثبيت OpenSSH إذا لم يكن مثبتاً
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          
+          # تكوين SSH
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType 'Automatic'
+          
+          # السماح لكلمة مرور Root عبر SSH
+          $sshdConfigPath = "$env:ProgramData\ssh\sshd_config"
+          $config = Get-Content $sshdConfigPath
+          $config = $config -replace '#?PasswordAuthentication no', 'PasswordAuthentication yes'
+          $config = $config -replace '#?PermitRootLogin no', 'PermitRootLogin yes'
+          Set-Content -Path $sshdConfigPath -Value $config
+          
+          # إعادة تشغيل خدمة SSH
+          Restart-Service sshd
+          
+          Write-Host "SSH Server configured on port 22"
+
+      - name: Create Maintenance Scripts
+        run: |
+          # سكريبت لإعادة تعيين كلمة المرور
+          $resetScript = @'
+          # Auto-reset password script
+          $newPassword = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 20 | % {[char]$_})
+          $securePass = ConvertTo-SecureString $newPassword -AsPlainText -Force
+          Set-LocalUser -Name "$env:RDP_USERNAME" -Password $securePass
+          
+          # Update credentials file
+          $creds = @{
+              Username = "$env:RDP_USERNAME"
+              Password = $newPassword
+              ResetTime = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          } | ConvertTo-Json
+          
+          Set-Content -Path "C:\RDP-Session\credentials.json" -Value $creds -Encoding UTF8
+          Write-Host "Password reset at: $(Get-Date -Format 'HH:mm:ss')"
+'@
+          
+          Set-Content -Path "C:\RDP-Session\reset-password.ps1" -Value $resetScript
+          
+          # سكريبت لمراقبة الجلسة
+          $monitorScript = @'
+          # Session monitor script
+          while ($true) {
+              $activeSessions = (qwinsta | Where-Object { $_ -match 'Active' }).Count
+              $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+              $uptime = (Get-Date) - (Get-Content "C:\RDP-Session\session-info.json" | ConvertFrom-Json).StartTime | Select-Object Days, Hours, Minutes
+              
+              $status = @{
+                  Timestamp = $timestamp
+                  ActiveSessions = $activeSessions
+                  Uptime = "$($uptime.Days)d $($uptime.Hours)h $($uptime.Minutes)m"
+                  CPU = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+                  Memory = (Get-CimInstance Win32_OperatingSystem | ForEach-Object { 
+                      "{0:N1}%" -f ((($_.TotalVisibleMemorySize - $_.FreePhysicalMemory) * 100) / $_.TotalVisibleMemorySize) 
+                  })
+              }
+              
+              $status | ConvertTo-Json | Add-Content -Path "C:\RDP-Session\session-status.log"
+              Start-Sleep -Seconds 60
+          }
+'@
+          
+          Set-Content -Path "C:\RDP-Session\monitor-session.ps1" -Value $monitorScript
+          
+          # بدء مراقبة الجلسة في الخلفية
+          Start-Process powershell.exe -ArgumentList "-File", "C:\RDP-Session\monitor-session.ps1" -WindowStyle Hidden
+
+      - name: Display Connection Information
+        run: |
+          # إنشاء واجهة معلومات جميلة
+          $border = "=" * 70
+          $title = "INFINITE RDP SESSION"
+          
+          $info = @"
+          $border
+          $title
+          $border
+          
+          📍 Connection Information:
+          =========================
+          Hostname:      $env:HOSTNAME
+          IP Address:    $env:TAILSCALE_IP
+          Username:      $env:RDP_USERNAME
+          Password:      $env:RDP_PASSWORD
+          
+          🌐 Network Access:
+          =================
+          RDP Port:      3389 (via Tailscale only)
+          SSH Port:      22 (if enabled)
+          
+          ⚙️ Session Details:
+          ==================
+          Session ID:    $env:SESSION_ID
+          Start Time:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          Status:        ACTIVE ✓
+          
+          🔗 Quick Connect:
+          ================
+          1. Connect to Tailscale VPN
+          2. Open Remote Desktop Connection
+          3. Enter: $env:TAILSCALE_IP
+          4. Username: $env:RDP_USERNAME
+          
+          ⚠️ Important Notes:
+          ==================
+          • Session will remain active indefinitely
+          • Monitor GitHub Actions for auto-shutdown
+          • Password can be reset if needed
+          
+          $border
+"@
+          
+          Write-Host $info
+          
+          # حفظ المعلومات في ملف
+          Set-Content -Path "C:\RDP-Session\connection-info.txt" -Value $info
+          
+          # عرض QR Code للاتصال السريع (اختياري)
+          $rdpFileContent = @"
+full address:s:$env:TAILSCALE_IP
+username:s:$env:RDP_USERNAME
+"@
+          
+          Set-Content -Path "C:\RDP-Session\connection.rdp" -Value $rdpFileContent
+          Write-Host "RDP connection file saved to: C:\RDP-Session\connection.rdp"
+
+      - name: Infinite Session Maintenance Loop
+        run: |
+          # تهيئة متغيرات المراقبة
+          $sessionStart = Get-Date
+          $lastActivity = Get-Date
+          $resetInterval = ${{ github.event.inputs.reset_every_hours }} * 3600  # تحويل إلى ثواني
+          $idleTimeout = ${{ github.event.inputs.idle_timeout }} * 60  # تحويل إلى ثواني
+          $resetCounter = 0
+          
+          Write-Host "`n🔄 Entering infinite maintenance loop..."
+          Write-Host "Auto-reset every: ${{ github.event.inputs.reset_every_hours }} hours"
+          Write-Host "Idle timeout: ${{ github.event.inputs.idle_timeout }} minutes"
+          Write-Host "Press Ctrl+C in GitHub UI to stop session`n"
+          
+          # الحلقة الرئيسية اللانهائية
+          while ($true) {
+              $currentTime = Get-Date
+              $uptime = $currentTime - $sessionStart
+              
+              # التحقق من النشاط
+              $activeSessions = (qwinsta | Where-Object { $_ -match 'Active' }).Count
+              
+              if ($activeSessions -gt 0) {
+                  $lastActivity = $currentTime
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active sessions: $activeSessions"
+              }
+              
+              # التحقق من مهلة الخمول
+              $idleTime = ($currentTime - $lastActivity).TotalSeconds
+              if ($idleTimeout -gt 0 -and $idleTime -gt $idleTimeout) {
+                  Write-Host "⏰ Idle timeout reached ($idleTimeout seconds). Shutting down..."
+                  break
+              }
+              
+              # التحقق من إعادة التعيين الدورية
+              if ($resetInterval -gt 0 -and $uptime.TotalSeconds -gt $resetInterval) {
+                  $resetCounter++
+                  Write-Host "🔄 Performing scheduled reset #$resetCounter..."
+                  
+                  # إعادة تعيين كلمة المرور
+                  powershell.exe -File "C:\RDP-Session\reset-password.ps1"
+                  
+                  # إعادة تشغيل خدمة RDP
+                  Restart-Service TermService -Force
+                  
+                  $sessionStart = Get-Date
+                  Write-Host "Reset completed at $(Get-Date -Format 'HH:mm:ss')"
+              }
+              
+              # تحديث حالة النظام
+              $cpuUsage = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+              $memoryUsage = (Get-CimInstance Win32_OperatingSystem | ForEach-Object { 
+                  [math]::Round((($_.TotalVisibleMemorySize - $_.FreePhysicalMemory) * 100) / $_.TotalVisibleMemorySize, 1)
+              })
+              
+              # تسجيل الحالة كل 5 دقائق
+              if ((Get-Date).Minute % 5 -eq 0) {
+                  $status = @{
+                      Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                      Uptime = "$([math]::Floor($uptime.TotalHours))h $([math]::Floor($uptime.Minutes))m"
+                      ActiveSessions = $activeSessions
+                      CPU = "$cpuUsage%"
+                      Memory = "$memoryUsage%"
+                      IdleTime = "$([math]::Floor($idleTime / 60))m"
+                  }
+                  
+                  Write-Host "[STATUS] $($status | ConvertTo-Json -Compress)"
+              }
+              
+              # الانتظار قبل التكرار التالي
+              Start-Sleep -Seconds 30
+          }
+          
+          Write-Host "Session ending..."
+          
+      - name: Cleanup on Exit
+        if: always()
+        run: |
+          Write-Host "🔄 Performing cleanup..."
+          
+          # إيقاف مراقبة الجلسة
+          Get-Process powershell -ErrorAction SilentlyContinue | 
+              Where-Object { $_.CommandLine -match "monitor-session" } | 
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          
+          # تسجيل وقت النهاية
+          $endInfo = @{
+              EndTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+              SessionID = $env:SESSION_ID
+              Reason = "Manual shutdown or timeout"
+          } | ConvertTo-Json
+          
+          Add-Content -Path "C:\RDP-Session\session-info.json" -Value "`n$endInfo"
+          
+          # تعطيل RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 1 -Force
+          
+          # حذف قواعد الجدار الناري
+          netsh advfirewall firewall delete rule name="GitHub-RDP-Infinite" 2>$null
+          netsh advfirewall firewall delete rule name="GitHub-SSH-Infinite" 2>$null
+          netsh advfirewall firewall delete rule name="Block-Public-RDP" 2>$null
+          
+          # قطع اتصال Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout 2>$null
+          
+          # حذف المستخدم (اختياري)
+          # Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          
+          Write-Host "✅ Cleanup completed"
+          Write-Host "Session logs saved in: C:\RDP-Session\"
